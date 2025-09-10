@@ -12,7 +12,7 @@ This repo includes:
   - `refrag_quickstart_auto_accel.sh` (Linux/macOS) — detects **CUDA → ROCm → MPS → CPU**
   - `refrag_quickstart_auto_accel.bat` (Windows) — detects **CUDA → CPU**
 
-> **Paper basis:** “RETHINKING RAG based Decoding (REFRAG)” — this re-creates the **compress → sense/select → expand** architecture described in the first 11 pages of the paper.
+> **Paper basis:** “RETHINKING RAG based Decoding (REFRAG)” — this re-creates the **compress → sense/select → expand** architecture described in the first 11 pages of the paper. https://arxiv.org/abs/2509.01092
 
 ---
 
