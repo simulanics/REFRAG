@@ -1,0 +1,5 @@
+Alexander Fleming discovered penicillin in 1928 at St. Mary's Hospital in London.
+The capital of France is Paris.
+Alan Turing proposed the Turing test in 1950.
+Penicillin is an antibiotic derived from Penicillium fungi.
+Large language models can use retrieval to augment their context.

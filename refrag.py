@@ -23,10 +23,10 @@ USAGE (examples):
   #    python refrag.py index --corpus data/wiki_lines.txt --index_dir runs/index --embed_model BAAI/bge-small-en-v1.5
 
   # 2) Continual pretraining (CPT) phase A: Reconstruction curriculum (freeze decoder)
-  #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-3B
+  #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-1B
 
   # 3) Continual pretraining (CPT) phase B: Next-paragraph prediction curriculum (unfreeze decoder)
-  #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-3B
+  #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-1B
 
   # 4) Optional: train the RL policy that decides selective expansion (REINFORCE, reward=-PPL)
   #    python refrag.py train_policy --rag_json data/rag_train.jsonl --index_dir runs/index --topk 8
@@ -395,9 +395,16 @@ class REFRAG(nn.Module):
     # ----------------------------
     # Losses for CPT & RL policy
     # ----------------------------
-
     def loss_reconstruction(self, ctx_text: str, k: int, num_chunks_cap: Optional[int] = None) -> torch.Tensor:
-        """Train encoder+projector to reconstruct tokens chunk-by-chunk from a single projected vector."""
+        """
+        Train encoder+projector to reconstruct tokens chunk-by-chunk from a single projected vector.
+
+        Implementation detail:
+        For each chunk, we repeat the single projected vector across the chunk length so that
+        inputs_embeds has shape [1, T_chunk, D] to match labels [1, T_chunk]. This resolves the
+        batch/sequence mismatch raised by cross_entropy in HF's causal LM loss.
+        """
+        # 1) Chunk the context in decoder token space
         chunk_strs, chunk_ids = self._chunk_text(ctx_text, k_tokens=k)
         if num_chunks_cap is not None:
             chunk_strs = chunk_strs[:num_chunks_cap]
@@ -406,16 +413,29 @@ class REFRAG(nn.Module):
         if L == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        c = self._encode_chunks(chunk_strs)  # [L,D_enc]
-        e = self._project_chunks(c)          # [L,D_dec]
+        # 2) Encode chunks (encoder space) → project to decoder embedding space
+        c = self._encode_chunks(chunk_strs)      # [L, D_enc]
+        e = self._project_chunks(c)              # [L, D_dec]
 
+        # 3) Per-chunk reconstruction loss
         loss_accum = 0.0
         for i, ids in enumerate(chunk_ids):
-            inp_emb = e[i].unsqueeze(0).unsqueeze(0)  # [1,1,D]
-            labels = ids.unsqueeze(0).to(self.device)
-            out = self.decoder(inputs_embeds=inp_emb, labels=labels)
+            # Labels: shape [1, T]
+            labels = ids.unsqueeze(0).to(self.device)              # [1, T]
+            T = labels.size(1)
+
+            # Inputs: repeat the single compressed vector across T time steps → [1, T, D_dec]
+            # (expand is fine and memory-light; make contiguous to be safe for certain backends)
+            inp_emb = e[i].unsqueeze(0).unsqueeze(1).expand(1, T, -1).contiguous()  # [1, T, D]
+
+            # Optional: attention mask (all ones since we provide T tokens)
+            attn_mask = torch.ones((1, T), dtype=torch.long, device=self.device)
+
+            out = self.decoder(inputs_embeds=inp_emb, attention_mask=attn_mask, labels=labels)
             loss_accum = loss_accum + out.loss
+
         return loss_accum / max(L, 1)
+
 
     def loss_next_para(self, full_text: str, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
         """Feed first s tokens (compressed) and predict next o tokens (teacher-forced)."""
