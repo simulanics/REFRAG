@@ -64,13 +64,6 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-# Transformers cache API (tuple past_key_values is deprecated in newer versions)
-try:
-    from transformers.cache_utils import Cache, DynamicCache
-except Exception:
-    Cache = None
-    DynamicCache = None
-
 try:
     import faiss  # pip install faiss-cpu
 except Exception:
@@ -102,31 +95,6 @@ def ensure_faiss():
         raise RuntimeError(
             "FAISS is not installed. Install with `pip install faiss-cpu` (or faiss-gpu)."
         )
-
-
-def safe_torch_load(path: str, map_location=None):
-    """
-    torch.load() now warns that the default weights_only=False is unsafe (pickle).
-    Prefer weights_only=True when supported; fall back for older torch versions.
-
-    If you *must* load a non-weights-only checkpoint and you fully trust the source,
-    set REFRAG_ALLOW_UNSAFE_TORCH_LOAD=1 to allow a fallback to weights_only=False.
-    """
-    # Prefer safe weights-only loading when available.
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:
-        # Older torch: no weights_only kwarg.
-        return torch.load(path, map_location=map_location)
-    except Exception as e:
-        # Optional unsafe fallback for trusted sources only.
-        allow_unsafe = os.environ.get("REFRAG_ALLOW_UNSAFE_TORCH_LOAD", "").strip().lower() in ("1", "true", "yes", "y", "on")
-        if allow_unsafe:
-            try:
-                return torch.load(path, map_location=map_location, weights_only=False)
-            except TypeError:
-                return torch.load(path, map_location=map_location)
-        raise
 
 
 # ----------------------------
@@ -278,22 +246,6 @@ class REFRAG(nn.Module):
         self.eos_id = self.decoder_tok.eos_token_id
         self.pad_id = self.decoder_tok.pad_token_id or self.decoder_tok.eos_token_id
 
-    def _new_cache(self):
-        # Prefer the modern cache API when available; fall back to legacy tuple behavior otherwise.
-        if DynamicCache is None:
-            return None
-        return DynamicCache()
-
-    def _ensure_cache(self, past_key_values):
-        # Convert legacy tuple past_key_values into a Cache instance to avoid deprecation warnings.
-        if Cache is None or DynamicCache is None:
-            return past_key_values
-        if past_key_values is None:
-            return DynamicCache()
-        if isinstance(past_key_values, Cache):
-            return past_key_values
-        return DynamicCache.from_legacy_cache(past_key_values)
-
     def _tokenize(self, text: str, max_len: int) -> Dict[str, torch.Tensor]:
         return self.decoder_tok(text, truncation=True, max_length=max_len, padding=False, return_tensors="pt")
 
@@ -401,10 +353,9 @@ class REFRAG(nn.Module):
         emb_in, extras = self.build_decoder_inputs(question, passages, k=k, p=p, use_policy=use_policy)
 
         # Prefill → KV cache
-        cache = self._new_cache()
         t0 = time.time()
-        out = self.decoder(inputs_embeds=emb_in, use_cache=True, past_key_values=cache)
-        past_key_values = self._ensure_cache(out.past_key_values)
+        out = self.decoder(inputs_embeds=emb_in, use_cache=True)
+        past_key_values = out.past_key_values
         ttft = time.time() - t0
 
         generated = []
@@ -418,7 +369,7 @@ class REFRAG(nn.Module):
             ttit_list.append(time.time() - t1)
 
             logits = out.logits[:, -1, :]
-            past_key_values = self._ensure_cache(out.past_key_values)
+            past_key_values = out.past_key_values
             if temperature > 0.0:
                 probs = F.softmax(logits / max(temperature, 1e-6), dim=-1)
                 next_id = torch.multinomial(probs, num_samples=1)
@@ -566,9 +517,8 @@ class REFRAG(nn.Module):
         # ---- build a short "target" continuation to score (no grad) ----
         with torch.no_grad():
             # quick greedy rollout conditioned on dec_in to synthesize a target
-            cache = self._new_cache()
-            out = self.decoder(inputs_embeds=dec_in, use_cache=True, past_key_values=cache)
-            past = self._ensure_cache(out.past_key_values)
+            out = self.decoder(inputs_embeds=dec_in, use_cache=True)
+            past = out.past_key_values
             rollout = []
             last = torch.tensor([[self.eos_id]], device=self.device)
             for _ in range(32):
@@ -579,7 +529,7 @@ class REFRAG(nn.Module):
                 if nid == self.eos_id:
                     break
                 rollout.append(nid)
-                past = self._ensure_cache(o2.past_key_values)
+                past = o2.past_key_values
             target = torch.tensor([rollout[:16] or [self.eos_id]], device=self.device, dtype=torch.long)  # [1, T_tgt]
 
         # ---- compute reward = -PPL with proper masked labels (no grad) ----
@@ -706,9 +656,9 @@ def cmd_cpt_next(args):
         enc_p = os.path.join(args.load_dir, "encoder.pt")
         proj_p = os.path.join(args.load_dir, "projector.pt")
         if os.path.exists(enc_p):
-            model.encoder.load_state_dict(safe_torch_load(enc_p, map_location=now_device()))
+            model.encoder.load_state_dict(torch.load(enc_p, map_location=now_device()))
         if os.path.exists(proj_p):
-            model.projector.load_state_dict(safe_torch_load(proj_p, map_location=now_device()))
+            model.projector.load_state_dict(torch.load(proj_p, map_location=now_device()))
         print("[cpt_next] loaded encoder/projector init.")
 
     params = list(model.parameters())  # unfreeze all
@@ -752,8 +702,8 @@ def cmd_train_policy(args):
     # Optional warm-start
     if args.load_dir:
         try:
-            model.encoder.load_state_dict(safe_torch_load(os.path.join(args.load_dir, "encoder.pt"), map_location=now_device()))
-            model.projector.load_state_dict(safe_torch_load(os.path.join(args.load_dir, "projector.pt"), map_location=now_device()))
+            model.encoder.load_state_dict(torch.load(os.path.join(args.load_dir, "encoder.pt"), map_location=now_device()))
+            model.projector.load_state_dict(torch.load(os.path.join(args.load_dir, "projector.pt"), map_location=now_device()))
             print("[train_policy] loaded encoder/projector init.")
         except Exception:
             pass
@@ -827,15 +777,15 @@ def cmd_generate(args):
         pol_p = os.path.join(args.load_dir, "policy.pt")
         full_p = os.path.join(args.load_dir, "refrag_full.pt")
         if os.path.exists(full_p):
-            model.load_state_dict(safe_torch_load(full_p, map_location=now_device()), strict=False)
+            model.load_state_dict(torch.load(full_p, map_location=now_device()), strict=False)
             print("[generate] loaded full model weights.")
         else:
             if os.path.exists(enc_p):
-                model.encoder.load_state_dict(safe_torch_load(enc_p, map_location=now_device()))
+                model.encoder.load_state_dict(torch.load(enc_p, map_location=now_device()))
             if os.path.exists(proj_p):
-                model.projector.load_state_dict(safe_torch_load(proj_p, map_location=now_device()))
+                model.projector.load_state_dict(torch.load(proj_p, map_location=now_device()))
             if os.path.exists(pol_p):
-                model.policy.load_state_dict(safe_torch_load(pol_p, map_location=now_device()))
+                model.policy.load_state_dict(torch.load(pol_p, map_location=now_device()))
             print("[generate] loaded available component weights.")
 
     texts, index = load_index_bundle(args.index_dir)

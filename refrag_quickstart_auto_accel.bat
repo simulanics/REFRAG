@@ -64,27 +64,6 @@ pip install faiss-cpu
 REM Common deps
 pip install "transformers==4.43.3" accelerate sentencepiece sacrebleu numpy
 
-REM ---- Patch refrag.py to use MPS (ignored on Windows), and prefer CUDA when available ----
-python - <<PY
-import io,re,sys,pathlib
-p=pathlib.Path("refrag.py")
-s=p.read_text(encoding="utf-8")
-if "torch.backends.mps" not in s:
-    s=re.sub(
-        r"def now_device\(\):\n[^\n]*return torch\.device\('[^']+'\)[^\n]*\n",
-        "def now_device():\n"
-        "    if hasattr(torch, 'cuda') and torch.cuda.is_available():\n"
-        "        return torch.device('cuda')\n"
-        "    if hasattr(torch.backends, 'mps') and getattr(torch.backends, 'mps').is_available():\n"
-        "        return torch.device('mps')\n"
-        "    return torch.device('cpu')\n",
-        s, flags=re.DOTALL)
-    p.write_text(s, encoding="utf-8")
-    print("[patch] Updated now_device() to support CUDA → MPS → CPU.")
-else:
-    print("[patch] MPS logic already present; no change.")
-PY
-
 set TOKENIZERS_PARALLELISM=false
 
 REM 1) Toy corpus + index
