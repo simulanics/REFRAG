@@ -421,7 +421,23 @@ class REFRAG(nn.Module):
             past_key_values = self._ensure_cache(out.past_key_values)
             if temperature > 0.0:
                 probs = F.softmax(logits / max(temperature, 1e-6), dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
+                if top_p < 1.0:
+                    # --- top-p (nucleus) sampling ---
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            
+                    # Remove tokens whose cumulative probability exceeds top_p
+                    cutoff = cumulative_probs > top_p
+                    cutoff[..., 1:] = cutoff[..., :-1].clone()
+                    cutoff[..., 0] = False
+            
+                    sorted_probs[cutoff] = 0.0
+                    sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+            
+                    next_id = torch.multinomial(sorted_probs, num_samples=1)
+                    next_id = sorted_indices.gather(-1, next_id)
+                else:
+                    next_id = torch.multinomial(probs, num_samples=1)
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
 
