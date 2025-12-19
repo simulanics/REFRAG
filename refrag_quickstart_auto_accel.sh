@@ -68,7 +68,7 @@ else
 fi
 
 # Common deps
-pip install "transformers==4.43.3" accelerate sentencepiece sacrebleu numpy
+pip install "transformers==4.57.3" accelerate sentencepiece sacrebleu numpy
 
 # ---- Patch refrag.py to use MPS if available (and keep CUDA/CPU fallback) ----
 python - <<'PY'

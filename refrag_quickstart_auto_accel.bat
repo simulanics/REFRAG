@@ -5,7 +5,7 @@ REM ===== Settings (customize) =====
 set ENC_MODEL=%ENC_MODEL%
 if "%ENC_MODEL%"=="" set ENC_MODEL=roberta-base
 set DEC_MODEL=%DEC_MODEL%
-if "%DEC_MODEL%"=="" set DEC_MODEL=meta-llama/Llama-3.2-3B
+if "%DEC_MODEL%"=="" set DEC_MODEL=LiquidAI/LFM2-350M
 set EMBED_MODEL=%EMBED_MODEL%
 if "%EMBED_MODEL%"=="" set EMBED_MODEL=BAAI/bge-small-en-v1.5
 set TOPK=%TOPK%
@@ -62,7 +62,7 @@ REM FAISS on Windows: use CPU (faiss-gpu wheels are not provided for Windows on 
 pip install faiss-cpu
 
 REM Common deps
-pip install "transformers==4.43.3" accelerate sentencepiece sacrebleu numpy
+pip install "transformers==4.57.3" accelerate sentencepiece sacrebleu numpy
 
 set TOKENIZERS_PARALLELISM=false
 

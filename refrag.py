@@ -17,16 +17,16 @@ It includes:
 USAGE (examples):
   # 0) Install deps (adjust CUDA wheel index if needed)
   #    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-  #    pip install transformers==4.43.3 accelerate datasets sentencepiece faiss-cpu sacrebleu numpy
+  #    pip install transformers==4.57.3 accelerate datasets sentencepiece faiss-cpu sacrebleu numpy
 
   # 1) Build a local FAISS index from a text corpus (1 doc per line)
   #    python refrag.py index --corpus data/wiki_lines.txt --index_dir runs/index --embed_model BAAI/bge-small-en-v1.5
 
   # 2) Continual pretraining (CPT) phase A: Reconstruction curriculum (freeze decoder)
-  #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-1B
+  #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec LiquidAI/LFM2-350M      //meta-llama/Llama-3.2-1B
 
   # 3) Continual pretraining (CPT) phase B: Next-paragraph prediction curriculum (unfreeze decoder)
-  #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-1B
+  #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec LiquidAI/LFM2-350M       //meta-llama/Llama-3.2-1B
 
   # 4) Optional: train the RL policy that decides selective expansion (REINFORCE, reward=-PPL)
   #    python refrag.py train_policy --rag_json data/rag_train.jsonl --index_dir runs/index --topk 8
@@ -503,23 +503,40 @@ class REFRAG(nn.Module):
 
 
     def loss_next_para(self, full_text: str, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
-        """Feed first s tokens (compressed) and predict next o tokens (teacher-forced)."""
+        """
+        Feed the first s tokens (compressed/expanded context) and predict the next o tokens.
+        Fixes: teacher-force by concatenating target token embeddings to inputs and mask labels
+        so only the target span contributes to loss.
+
+        Shapes after fix:
+        ctx_emb:   [1, T_ctx, D]
+        tgt_emb:   [1, T_tgt, D]   (T_tgt == len(out_ids) <= o)
+        inputs:    [1, T_ctx + T_tgt, D]
+        labels:    [1, T_ctx + T_tgt]   (labels[:, :T_ctx] = -100; labels[:, T_ctx:] = out_ids)
+        """
+        # Tokenize up to s + o and slice context/target
         toks = self.decoder_tok(full_text, truncation=True, max_length=s + o, return_tensors="pt")
         ids = toks.input_ids[0].to(self.device)
-        if ids.size(0) < s + 2:
+
+        # If there aren't enough tokens for a context, skip with 0-loss
+        if ids.size(0) < max(2, s + 1):
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         ctx_ids = ids[:s]
-        out_ids = ids[s:s + o]
-        ctx_str = self.decoder_tok.decode(ctx_ids, skip_special_tokens=True)
+        out_ids = ids[s:s + o]  # may be shorter than o due to truncation
 
+        # Build (compressed/expanded) context embedding sequence
+        ctx_str = self.decoder_tok.decode(ctx_ids, skip_special_tokens=True)
         chunk_strs, chunk_ids = self._chunk_text(ctx_str, k_tokens=k)
-        c = self._encode_chunks(chunk_strs)
-        e = self._project_chunks(c)
+
+        # Encoder→projector path for compressed chunks
+        c = self._encode_chunks(chunk_strs)  # [L, D_enc]
+        e = self._project_chunks(c)          # [L, D_dec]
 
         L = len(chunk_ids)
         expand_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
         if L > 0 and expand_frac > 0.0:
+            # simple length-based expansion: expand the longest chunks up to expand_frac
             top = max(1, int(round(expand_frac * L)))
             lengths = torch.tensor([len(ch) for ch in chunk_ids], device=self.device)
             top_idx = torch.topk(lengths, k=min(top, L)).indices
@@ -528,14 +545,39 @@ class REFRAG(nn.Module):
         seq = []
         for i, ids_i in enumerate(chunk_ids):
             if expand_mask[i]:
-                seq.append(self._decoder_token_embeddings(ids_i.unsqueeze(0)).squeeze(0))
+                # expanded: real token embeddings for this chunk
+                seq.append(self._decoder_token_embeddings(ids_i.unsqueeze(0)).squeeze(0))  # [t_i, D]
             else:
-                seq.append(e[i].unsqueeze(0))
+                # compressed: single slot
+                seq.append(e[i].unsqueeze(0))  # [1, D]
+
         if len(seq) == 0:
-            seq.append(self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0))
-        inp = torch.cat(seq, dim=0).unsqueeze(0)
-        labels = out_ids.unsqueeze(0)
-        out = self.decoder(inputs_embeds=inp, labels=labels)
+            # fallback: if no chunks (short context), embed ctx_ids directly
+            seq.append(self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0))  # [s, D]
+
+        ctx_emb = torch.cat(seq, dim=0).unsqueeze(0).contiguous()  # [1, T_ctx, D]
+        T_ctx = ctx_emb.size(1)
+
+        # Teacher-forced target embeddings
+        if out_ids.numel() == 0:
+            # nothing to predict; return 0-loss to keep training loop simple
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        tgt_ids = out_ids.unsqueeze(0).to(self.device)            # [1, T_tgt]
+        tgt_emb = self._decoder_token_embeddings(tgt_ids)         # [1, T_tgt, D]
+        T_tgt = tgt_emb.size(1)
+
+        # Concatenate context + target embeddings for a single forward
+        inputs = torch.cat([ctx_emb, tgt_emb], dim=1)             # [1, T_ctx + T_tgt, D]
+
+        # Attention mask (all ones)
+        attn_mask = torch.ones((1, T_ctx + T_tgt), dtype=torch.long, device=self.device)
+
+        # Labels: ignore context positions, supervise only the target span
+        labels = torch.full((1, T_ctx + T_tgt), -100, dtype=torch.long, device=self.device)
+        labels[0, T_ctx:T_ctx + T_tgt] = out_ids                  # align target to the last T_tgt positions
+
+        out = self.decoder(inputs_embeds=inputs, attention_mask=attn_mask, labels=labels)
         return out.loss
 
     def policy_step(self, question: str, passages: List[str], k: int, max_expand_frac: float) -> Tuple[torch.Tensor, torch.Tensor]:
