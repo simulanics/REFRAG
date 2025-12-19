@@ -504,26 +504,56 @@ class REFRAG(nn.Module):
 
     def loss_next_para(self, full_text: str, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
         """
-        Feed the first s tokens (compressed/expanded context) and predict the next o tokens.
-        Fixes: teacher-force by concatenating target token embeddings to inputs and mask labels
-        so only the target span contributes to loss.
+        Feed up to s tokens (compressed/expanded context) and predict up to o tokens.
+        Fix: treat s/o as maxima; clamp per-example so we always have target tokens when possible.
 
-        Shapes after fix:
+        Shapes:
         ctx_emb:   [1, T_ctx, D]
-        tgt_emb:   [1, T_tgt, D]   (T_tgt == len(out_ids) <= o)
+        tgt_emb:   [1, T_tgt, D]
         inputs:    [1, T_ctx + T_tgt, D]
         labels:    [1, T_ctx + T_tgt]   (labels[:, :T_ctx] = -100; labels[:, T_ctx:] = out_ids)
         """
-        # Tokenize up to s + o and slice context/target
+        # Tokenize (cap for speed, but we can still clamp within what we got)
         toks = self.decoder_tok(full_text, truncation=True, max_length=s + o, return_tensors="pt")
         ids = toks.input_ids[0].to(self.device)
+        N = int(ids.numel())
 
-        # If there aren't enough tokens for a context, skip with 0-loss
-        if ids.size(0) < max(2, s + 1):
+        # Need at least 2 tokens to have 1 context + 1 target
+        if N < 2:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        ctx_ids = ids[:s]
-        out_ids = ids[s:s + o]  # may be shorter than o due to truncation
+        # Choose a minimum target length to supervise (treat o as a max)
+        # If o is small, min_tgt shrinks with it.
+        min_tgt = min(o, 32)  # tune (e.g. 8/16/32/64) depending on your data
+        min_tgt = max(1, int(min_tgt))
+
+        # If the sequence is too short to provide min_tgt, fall back to "at least 1" target token
+        if N < (1 + min_tgt):
+            min_tgt = 1
+            if N < 2:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # Clamp context length so we leave room for at least min_tgt target tokens
+        ctx_len = min(int(s), N - min_tgt)
+        ctx_len = max(1, int(ctx_len))  # ensure at least 1 ctx token
+
+        # Target length is whatever remains, capped by o
+        tgt_len = min(int(o), N - ctx_len)
+        tgt_len = max(0, int(tgt_len))
+
+        if tgt_len <= 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # (Optional) random windowing inside the available tokenized span
+        total_len = ctx_len + tgt_len
+        if N > total_len:
+            # sample start in [0, N - total_len]
+            start = int(torch.randint(0, N - total_len + 1, (1,), device="cpu").item())
+        else:
+            start = 0
+
+        ctx_ids = ids[start:start + ctx_len]
+        out_ids = ids[start + ctx_len:start + ctx_len + tgt_len]
 
         # Build (compressed/expanded) context embedding sequence
         ctx_str = self.decoder_tok.decode(ctx_ids, skip_special_tokens=True)
@@ -536,7 +566,6 @@ class REFRAG(nn.Module):
         L = len(chunk_ids)
         expand_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
         if L > 0 and expand_frac > 0.0:
-            # simple length-based expansion: expand the longest chunks up to expand_frac
             top = max(1, int(round(expand_frac * L)))
             lengths = torch.tensor([len(ch) for ch in chunk_ids], device=self.device)
             top_idx = torch.topk(lengths, k=min(top, L)).indices
@@ -545,27 +574,24 @@ class REFRAG(nn.Module):
         seq = []
         for i, ids_i in enumerate(chunk_ids):
             if expand_mask[i]:
-                # expanded: real token embeddings for this chunk
                 seq.append(self._decoder_token_embeddings(ids_i.unsqueeze(0)).squeeze(0))  # [t_i, D]
             else:
-                # compressed: single slot
                 seq.append(e[i].unsqueeze(0))  # [1, D]
 
         if len(seq) == 0:
             # fallback: if no chunks (short context), embed ctx_ids directly
-            seq.append(self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0))  # [s, D]
+            seq.append(self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0))  # [ctx_len, D]
 
         ctx_emb = torch.cat(seq, dim=0).unsqueeze(0).contiguous()  # [1, T_ctx, D]
-        T_ctx = ctx_emb.size(1)
+        T_ctx = int(ctx_emb.size(1))
 
         # Teacher-forced target embeddings
         if out_ids.numel() == 0:
-            # nothing to predict; return 0-loss to keep training loop simple
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         tgt_ids = out_ids.unsqueeze(0).to(self.device)            # [1, T_tgt]
         tgt_emb = self._decoder_token_embeddings(tgt_ids)         # [1, T_tgt, D]
-        T_tgt = tgt_emb.size(1)
+        T_tgt = int(tgt_emb.size(1))
 
         # Concatenate context + target embeddings for a single forward
         inputs = torch.cat([ctx_emb, tgt_emb], dim=1)             # [1, T_ctx + T_tgt, D]
@@ -575,10 +601,11 @@ class REFRAG(nn.Module):
 
         # Labels: ignore context positions, supervise only the target span
         labels = torch.full((1, T_ctx + T_tgt), -100, dtype=torch.long, device=self.device)
-        labels[0, T_ctx:T_ctx + T_tgt] = out_ids                  # align target to the last T_tgt positions
+        labels[0, T_ctx:T_ctx + T_tgt] = out_ids
 
         out = self.decoder(inputs_embeds=inputs, attention_mask=attn_mask, labels=labels)
         return out.loss
+
 
     def policy_step(self, question: str, passages: List[str], k: int, max_expand_frac: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """One REINFORCE step: sample expansion mask, compute reward = -PPL of supervised continuation."""
