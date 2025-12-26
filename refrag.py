@@ -23,10 +23,10 @@ USAGE (examples):
   #    python refrag.py index --corpus data/wiki_lines.txt --index_dir runs/index --embed_model BAAI/bge-small-en-v1.5
 
   # 2) Continual pretraining (CPT) phase A: Reconstruction curriculum (freeze decoder)
-  #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec LiquidAI/LFM2-350M      //meta-llama/Llama-3.2-1B
+  #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-3B      //meta-llama/Llama-3.2-1B
 
   # 3) Continual pretraining (CPT) phase B: Next-paragraph prediction curriculum (unfreeze decoder)
-  #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec LiquidAI/LFM2-350M       //meta-llama/Llama-3.2-1B
+  #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-3B       //meta-llama/Llama-3.2-1B
 
   # 4) Optional: train the RL policy that decides selective expansion (REINFORCE, reward=-PPL)
   #    python refrag.py train_policy --rag_json data/rag_train.jsonl --index_dir runs/index --topk 8
@@ -56,6 +56,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 from transformers import (
     AutoTokenizer,
@@ -127,6 +129,27 @@ def safe_torch_load(path: str, map_location=None):
             except TypeError:
                 return torch.load(path, map_location=map_location)
         raise
+
+
+def maybe_torch_compile(module: nn.Module, enabled: bool, mode: str = "reduce-overhead", fullgraph: bool = False):
+    """
+    Optional torch.compile() wrapper controlled by a CLI flag.
+
+    Notes:
+      - torch.compile is available in PyTorch 2.0+.
+      - Compilation may fail for some models/devices/backends; this function safely falls back.
+      - We compile only the decoder module (the hottest path for CPT + generation).
+    """
+    if not enabled:
+        return module
+    if not hasattr(torch, "compile"):
+        print("[torch_compile] torch.compile not available in this PyTorch version; continuing without compile.")
+        return module
+    try:
+        return torch.compile(module, mode=mode, fullgraph=fullgraph)
+    except Exception as e:
+        print(f"[torch_compile] compile failed; continuing without compile. error={repr(e)}")
+        return module
 
 
 # ----------------------------
@@ -204,6 +227,7 @@ class REFRAGConfig:
     grad_clip: float = 1.0
     fp16: bool = True
     seed: int = 1337
+    torch_compile: bool = False
 
 
 class ChunkEncoder(nn.Module):
@@ -270,6 +294,9 @@ class REFRAG(nn.Module):
         self.encoder = ChunkEncoder(cfg.encoder_name).to(self.device)
         self.decoder_tok = AutoTokenizer.from_pretrained(cfg.decoder_name, use_fast=True)
         self.decoder = AutoModelForCausalLM.from_pretrained(cfg.decoder_name).to(self.device)
+
+        # Optional: torch.compile for the decoder hot path.
+        self.decoder = maybe_torch_compile(self.decoder, enabled=cfg.torch_compile)
 
         self.dec_embed_dim = self.decoder.get_input_embeddings().weight.shape[1]
         self.projector = TokenProjector(self.encoder.out_dim, self.dec_embed_dim).to(self.device)
@@ -425,15 +452,15 @@ class REFRAG(nn.Module):
                     # --- top-p (nucleus) sampling ---
                     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
                     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            
+
                     # Remove tokens whose cumulative probability exceeds top_p
                     cutoff = cumulative_probs > top_p
                     cutoff[..., 1:] = cutoff[..., :-1].clone()
                     cutoff[..., 0] = False
-            
+
                     sorted_probs[cutoff] = 0.0
                     sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-            
+
                     next_id = torch.multinomial(sorted_probs, num_samples=1)
                     next_id = sorted_indices.gather(-1, next_id)
                 else:
@@ -741,6 +768,7 @@ def cmd_cpt_recon(args):
         chunk_len_tokens=args.k,
         lr=args.lr,
         fp16=False,
+        torch_compile=args.torch_compile,
     )
     model = REFRAG(cfg).to(now_device())
     # Freeze decoder; train encoder+projector
@@ -784,6 +812,7 @@ def cmd_cpt_next(args):
         chunk_len_tokens=args.k,
         lr=args.lr,
         fp16=False,
+        torch_compile=args.torch_compile,
     )
     model = REFRAG(cfg).to(now_device())
     # Load from recon phase if provided
@@ -832,6 +861,7 @@ def cmd_train_policy(args):
         lr=args.lr,
         fp16=False,
         policy_hidden=args.policy_hidden,
+        torch_compile=args.torch_compile,
     )
     model = REFRAG(cfg).to(now_device())
     # Optional warm-start
@@ -902,7 +932,8 @@ def cmd_generate(args):
         max_ctx_tokens=args.ctx_max,
         max_out_tokens=args.max_new,
         selective_p=args.p,
-        fp16=False
+        fp16=False,
+        torch_compile=args.torch_compile,
     )
     model = REFRAG(cfg)
     # Optional load
@@ -967,6 +998,7 @@ def build_argparser():
     sp.add_argument("--lr", type=float, default=2e-5)
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--out_dir", type=str, default="runs/cpt_recon")
+    sp.add_argument("--torch_compile", action="store_true", help="Enable torch.compile for the decoder (PyTorch 2.0+)")
     sp.set_defaults(func=cmd_cpt_recon)
 
     # cpt_next
@@ -981,6 +1013,7 @@ def build_argparser():
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with encoder.pt/projector.pt")
     sp.add_argument("--out_dir", type=str, default="runs/cpt_next")
+    sp.add_argument("--torch_compile", action="store_true", help="Enable torch.compile for the decoder (PyTorch 2.0+)")
     sp.set_defaults(func=cmd_cpt_next)
 
     # train_policy
@@ -999,6 +1032,7 @@ def build_argparser():
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with encoder.pt/projector.pt")
     sp.add_argument("--out_dir", type=str, default="runs/policy")
+    sp.add_argument("--torch_compile", action="store_true", help="Enable torch.compile for the decoder (PyTorch 2.0+)")
     sp.set_defaults(func=cmd_train_policy)
 
     # generate
@@ -1017,6 +1051,7 @@ def build_argparser():
     sp.add_argument("--top_p", type=float, default=1.0)
     sp.add_argument("--heuristic", action="store_true", help="Use heuristic expansion instead of policy")
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with saved weights (encoder/projector/policy or refrag_full.pt)")
+    sp.add_argument("--torch_compile", action="store_true", help="Enable torch.compile for the decoder (PyTorch 2.0+)")
     sp.set_defaults(func=cmd_generate)
 
     return p

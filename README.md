@@ -144,7 +144,6 @@ What’s inside (`refrag/data/`):
 * `rag_train.jsonl` — 1,200 synthetic QA pairs aligned to the corpus (answers are deterministically embedded in docs)
 * `cpt_train.jsonl` — 400 long-form items for continual pretraining (reconstruction & next-paragraph)
 * `README_DATA.md` — usage, tips, and examples
-* `make_corpus.py` — a tiny reproducibility stub
 
 ### Quick usage
 
